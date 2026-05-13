@@ -1,0 +1,23 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 输出文件（不上传）
+output/
+
+# 输入文件（每个人的数据不一样，不上传）
+input/
+
+# 虚拟环境
+venv/
+.env
+
+# IDE 设置
+.vscode/
+.idea/
+
+# 系统文件
+Thumbs.db
+.DS_Store
