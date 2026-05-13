@@ -46,6 +46,8 @@ STATUS_COL = "状态"
 STUDENT_NAME_PATTERNS = ["学生姓名", "姓名", "学生名称"]
 
 MAX_PEOPLE_PER_UNIT = 3
+THIS_SUBMIT_COL = "本次上报人数"
+TOTAL_COUNT_COL = "全校已有人数"
 
 
 # ============================================================
@@ -61,6 +63,9 @@ def setup_logging():
 
 
 logger = setup_logging()
+
+# 操作日志：记录本次处理对表格做过的所有操作，最后输出
+operations_log = []
 
 
 # ============================================================
@@ -163,6 +168,58 @@ def _clean_company_name(name):
         '', name
     ).strip()
     return name
+
+
+def _find_best_fuzzy_match(search_name, candidates, threshold=0.4):
+    """从候选名称中找到与搜索名称最相似的一个。
+
+    使用 Jaccard 字符重叠度和子串包含关系进行模糊匹配。
+
+    Args:
+        search_name: 要搜索的名称
+        candidates: 候选名称列表
+        threshold: 相似度阈值（0-1），低于此值视为不匹配
+
+    Returns:
+        (best_match, similarity_score) 或 (None, 0.0)
+    """
+    if not candidates or not search_name:
+        return None, 0.0
+
+    search_chars = set(search_name)
+    best_match = None
+    best_score = 0.0
+
+    for candidate in candidates:
+        # 子串包含关系 → 高置信度直接返回
+        if search_name in candidate:
+            return candidate, 1.0
+        if candidate in search_name:
+            score = len(candidate) / max(len(search_name), 1) * 0.95
+            if score > best_score:
+                best_score = score
+                best_match = candidate
+            continue
+
+        # Jaccard 字符重叠度
+        candidate_chars = set(candidate)
+        intersection = len(search_chars & candidate_chars)
+        union = len(search_chars | candidate_chars)
+        jaccard = intersection / union if union > 0 else 0
+
+        # 长度接近度加分（避免短词误配）
+        len_ratio = min(len(search_name), len(candidate)) / max(len(search_name), len(candidate))
+
+        # 综合评分
+        score = jaccard * 0.7 + len_ratio * 0.3
+
+        if score > best_score:
+            best_score = score
+            best_match = candidate
+
+    if best_score >= threshold:
+        return best_match, best_score
+    return None, 0.0
 
 
 def _extract_company_name(block):
@@ -513,12 +570,41 @@ def phase1_match_and_fill(ws, df, enterprise_dict, col_indices):
         unit_name = str(unit_name).strip()
 
         if unit_name not in enterprise_dict:
-            # 企业信息未找到 → 标红
-            highlight_row(ws, row_idx, RED_FILL, num_cols)
-            red_rows.add(row_idx)
-            not_found_count += 1
-            logger.debug(f"  行{row_idx}：'{unit_name}' 未在企业信息中找到 → 标红")
-            continue
+            # 尝试模糊匹配（可能是书院填错了单位名称）
+            fuzzy_match, score = _find_best_fuzzy_match(
+                unit_name, list(enterprise_dict.keys())
+            )
+            if fuzzy_match:
+                # 找到相似单位 → 修正单位名称，使用匹配到的企业信息
+                ws.cell(row=row_idx, column=unit_col_idx, value=fuzzy_match)
+                info = enterprise_dict[fuzzy_match]
+
+                correct_credit = info.get(CREDIT_CODE_COL, "")
+                if credit_col_idx and correct_credit:
+                    ws.cell(row=row_idx, column=credit_col_idx, value=correct_credit)
+                correct_capital = info.get(REG_CAPITAL_COL, "")
+                if capital_col_idx and correct_capital:
+                    ws.cell(row=row_idx, column=capital_col_idx, value=correct_capital)
+
+                highlight_row(ws, row_idx, YELLOW_FILL, num_cols)
+                yellow_rows.add(row_idx)
+                if reason_col_idx:
+                    append_reason(ws, row_idx, reason_col_idx,
+                                  f"单位名称有误，已纠正为：{fuzzy_match}")
+                corrected_count += 1
+                operations_log.append(
+                    f"  行{row_idx}：单位名称'{unit_name}'模糊匹配→'{fuzzy_match}'（相似度{score:.0%}），已修正"
+                )
+                matched_count += 1
+                logger.debug(f"  行{row_idx}：'{unit_name}' 模糊匹配→'{fuzzy_match}'（{score:.0%}）")
+                continue
+            else:
+                # 企业信息未找到 → 标红
+                highlight_row(ws, row_idx, RED_FILL, num_cols)
+                red_rows.add(row_idx)
+                not_found_count += 1
+                logger.debug(f"  行{row_idx}：'{unit_name}' 未在企业信息中找到 → 标红")
+                continue
 
         matched_count += 1
         info = enterprise_dict[unit_name]
@@ -542,6 +628,9 @@ def phase1_match_and_fill(ws, df, enterprise_dict, col_indices):
                     append_reason(ws, row_idx, reason_col_idx,
                                   f"信用代码错误，已纠正为：{correct_credit}")
                 corrected_count += 1
+                operations_log.append(
+                    f"  行{row_idx}：'{unit_name}' 信用代码已纠正为 {correct_credit}"
+                )
                 logger.debug(f"  行{row_idx}：'{unit_name}' 信用代码已纠正")
 
         # ---- 处理注册资本（静默覆盖） ----
@@ -606,10 +695,24 @@ def phase2_headcount_rule(ws, df, total_df, col_indices, yellow_rows, red_rows):
         current_count = len(active_rows)
 
         # 总表中该单位已有人数
+        # 优先使用 全校已有人数 列（用于支持总表去重后的行数统计）
         try:
-            existing_count = len(total_df[
-                total_df[total_unit_col].astype(str).str.strip() == unit
-            ])
+            unit_rows = total_df[total_df[total_unit_col].astype(str).str.strip() == unit]
+            if unit_rows.empty:
+                existing_count = 0
+            else:
+                # 查找是否包含"全校已有人数"列
+                total_count_col_name = None
+                for col in total_df.columns:
+                    if col and TOTAL_COUNT_COL in str(col):
+                        total_count_col_name = col
+                        break
+                if total_count_col_name:
+                    existing_count = int(pd.to_numeric(
+                        unit_rows[total_count_col_name], errors='coerce'
+                    ).sum())
+                else:
+                    existing_count = len(unit_rows)
         except Exception:
             existing_count = 0
 
@@ -629,6 +732,10 @@ def phase2_headcount_rule(ws, df, total_df, col_indices, yellow_rows, red_rows):
                         new_yellows.add(r_idx)
                         if reason_col_idx:
                             append_reason(ws, r_idx, reason_col_idx, reason)
+                operations_log.append(
+                    f"  '{unit}'：全校已有{existing_count}人，本次上报{current_count}人，"
+                    f"最多增{y}人，{excess_count}行因超额标黄"
+                )
                 logger.info(f"  '{unit}'：全校已有{existing_count}人，"
                             f"本次上报{current_count}人，最多增{y}人 → {excess_count}行超出")
 
@@ -691,6 +798,10 @@ def phase2_capital_rule(ws, df, enterprise_dict, col_indices, yellow_rows, red_r
                     new_yellows.add(r_idx)
                     if reason_col_idx:
                         append_reason(ws, r_idx, reason_col_idx, reason)
+                operations_log.append(
+                    f"  '{unit}'：注册资本{cap_value}万（20~50万区间），"
+                    f"上报{active_count}人超过2人限制 → 标黄"
+                )
                 logger.info(f"  '{unit}'：注册资本{cap_value}万元"
                             f"（20~50万区间），上报{active_count}人 > 2人 → 标黄")
         elif 0 < cap_value < 20:
@@ -700,6 +811,9 @@ def phase2_capital_rule(ws, df, enterprise_dict, col_indices, yellow_rows, red_r
                 new_yellows.add(r_idx)
                 if reason_col_idx:
                     append_reason(ws, r_idx, reason_col_idx, reason)
+            operations_log.append(
+                f"  '{unit}'：注册资本{cap_value}万（少于20万）→ 标黄，需反馈老师确认"
+            )
             logger.info(f"  '{unit}'：注册资本{cap_value}万元"
                         f"（少于20万）→ 标黄")
 
@@ -742,6 +856,7 @@ def phase2_other_rules(ws, df, col_indices, yellow_rows, red_rows):
 
     yellow_rows.update(new_yellows)
     if new_yellows:
+        operations_log.append(f"  个体工商户检查：{len(new_yellows)} 行因92开头被标黄")
         logger.info(f"个体工商户检查完成，{len(new_yellows)} 行被标黄")
     else:
         logger.info("个体工商户检查完成，无匹配项")
@@ -793,6 +908,7 @@ def phase2_status_rule(ws, df, enterprise_dict, col_indices, yellow_rows, red_ro
 
     yellow_rows.update(new_yellows)
     if new_yellows:
+        operations_log.append(f'  企业状态审核：{len(new_yellows)} 行因状态为"注销"被标黄')
         logger.info(f"企业状态审核完成，{len(new_yellows)} 行被标黄（状态为注销）")
     else:
         logger.info("企业状态审核完成，无注销状态企业")
@@ -810,9 +926,9 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
     合并逻辑：
       1. 跳过标红行和因人数超限额标黄的行
       2. 因数据错误（信用代码、注册资本、个体工商户、状态）标黄的行仍可合并
-      3. 被合并的行附加到总表末尾，使用修正后的企业信息
-      4. 对每个单位，计算总表已有行数，不超过 MAX_PEOPLE_PER_UNIT
-      5. 因超额未合并的行，在书院表的"原因"列追加说明并标黄
+      3. 只复制 单位名称、社会信用代码、注册资本、本次上报人数 四列
+      4. 本次上报人数 → 全校已有人数（标黄行用 y 值）
+      5. 合并后按单位名称去重，累加全校已有人数
 
     返回更新后的总表 workbook 对象。
     """
@@ -827,6 +943,7 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
     credit_col_idx = col_indices.get(CREDIT_CODE_COL)
     capital_col_idx = col_indices.get(REG_CAPITAL_COL)
     reason_col_idx = col_indices.get(REASON_COL)
+    submit_col_idx = col_indices.get(THIS_SUBMIT_COL)
 
     if unit_col_idx is None:
         logger.error("找不到'单位'列，无法合并")
@@ -846,15 +963,27 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
         if cell.value:
             total_col_indices[cell.value] = cell.column
 
-    # 查找总表中"单位名称"列
+    # 确保总表有"全校已有人数"列
+    total_col_indices = ensure_columns(total_ws, total_col_indices,
+                                        [TOTAL_COUNT_COL])
+
+    # 查找各列在总表中的位置
     total_unit_col = None
+    total_credit_col = None
+    total_capital_col = None
+    total_count_col = None
     for hdr, idx in total_col_indices.items():
         if hdr and "单位" in str(hdr):
             total_unit_col = idx
-            break
+        if hdr == CREDIT_CODE_COL:
+            total_credit_col = idx
+        if hdr == REG_CAPITAL_COL:
+            total_capital_col = idx
+        if hdr == TOTAL_COUNT_COL:
+            total_count_col = idx
 
     if total_unit_col is None:
-        logger.error("全校总表中找不到'单位名称'列，无法合并")
+        logger.error("全校总表中找不到'单位'列，无法合并")
         total_wb.close()
         return None
 
@@ -868,9 +997,7 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
             existing_counts[unit] = existing_counts.get(unit, 0) + 1
 
     # ---- 收集书院表中各单位的已审核通过的行 ----
-    # 跳过标红行和因人数超额标黄的行；其他标黄（信用代码、资本等）仍可合并
-    unit_approved = {}  # {unit: [list of row indices]}
-    all_units = set()
+    unit_approved = {}
 
     for row_idx in range(2, ws.max_row + 1):
         if row_idx in red_rows or row_idx in headcount_yellow_rows:
@@ -879,20 +1006,27 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
         if val and str(val).strip():
             unit = str(val).strip()
             unit_approved.setdefault(unit, []).append(row_idx)
-            all_units.add(unit)
 
     logger.info(f"待合并单位数：{len(unit_approved)}")
+
+    # ---- 列映射定义 ----
+    # 确定要复制的列对：(书院列名, 总表列名, 是否用企业字典修正值)
+    column_mappings = []
+    if unit_col_idx and total_unit_col:
+        column_mappings.append((UNIT_NAME_COL, None, False))
+    if credit_col_idx and total_credit_col:
+        column_mappings.append((CREDIT_CODE_COL, None, True))
+    if capital_col_idx and total_capital_col:
+        column_mappings.append((REG_CAPITAL_COL, None, True))
 
     # ---- 执行合并 ----
     merged_total = 0
     skipped_total = 0
 
-    # 确定书院表和总表的共有列（按名称匹配）
-    common_columns = set(col_indices.keys()) & set(total_col_indices.keys())
-
     for unit, approved_rows in unit_approved.items():
         existing = existing_counts.get(unit, 0)
         can_add = MAX_PEOPLE_PER_UNIT - existing
+        y = max(0, can_add)  # 最多还能增加的人数
 
         if can_add <= 0:
             # 名额已满，全部跳过
@@ -900,10 +1034,12 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
                 if reason_col_idx:
                     append_reason(ws, r_idx, reason_col_idx,
                                   "因全校该单位名额已满，未合并")
-                # 将跳过的行也标黄（以便在结果中明显标识）
                 highlight_row(ws, r_idx, YELLOW_FILL, ws.max_column)
                 yellow_rows.add(r_idx)
             skipped_total += len(approved_rows)
+            operations_log.append(
+                f"  '{unit}'：名额已满（总表已有{existing}人），跳过{len(approved_rows)}行"
+            )
             logger.info(f"  '{unit}'：名额已满（总表已有{existing}人），"
                         f"跳过{len(approved_rows)}行")
             continue
@@ -918,19 +1054,33 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
             new_row_idx = last_total_row + 1
             last_total_row = new_row_idx
 
-            for header in common_columns:
-                sheet_col = col_indices[header]
-                total_col = total_col_indices[header]
+            # 复制 单位名称
+            total_ws.cell(row=new_row_idx, column=total_unit_col,
+                          value=ws.cell(row=r_idx, column=unit_col_idx).value)
 
-                # 单位名称、信用代码、注册资本这三列使用企业字典中的修正值
-                if header == CREDIT_CODE_COL and unit in enterprise_dict:
-                    val = enterprise_dict[unit].get(CREDIT_CODE_COL, "")
-                elif header == REG_CAPITAL_COL and unit in enterprise_dict:
-                    val = enterprise_dict[unit].get(REG_CAPITAL_COL, "")
+            # 复制 社会信用代码（使用企业字典修正值）
+            if total_credit_col is not None:
+                val = enterprise_dict.get(unit, {}).get(CREDIT_CODE_COL, "")
+                if not val:
+                    val = ws.cell(row=r_idx, column=credit_col_idx).value if credit_col_idx else ""
+                total_ws.cell(row=new_row_idx, column=total_credit_col, value=val)
+
+            # 复制 注册资本（使用企业字典修正值）
+            if total_capital_col is not None:
+                val = enterprise_dict.get(unit, {}).get(REG_CAPITAL_COL, "")
+                if not val:
+                    val = ws.cell(row=r_idx, column=capital_col_idx).value if capital_col_idx else ""
+                total_ws.cell(row=new_row_idx, column=total_capital_col, value=val)
+
+            # 本次上报人数 → 全校已有人数
+            if total_count_col is not None:
+                if r_idx in yellow_rows:
+                    # 标黄行：使用 y 值（剩余可增人数）
+                    total_ws.cell(row=new_row_idx, column=total_count_col, value=y)
                 else:
-                    val = ws.cell(row=r_idx, column=sheet_col).value
-
-                total_ws.cell(row=new_row_idx, column=total_col, value=val)
+                    # 非标黄行：使用本次上报人数
+                    submit_val = ws.cell(row=r_idx, column=submit_col_idx).value if submit_col_idx else 1
+                    total_ws.cell(row=new_row_idx, column=total_count_col, value=submit_val)
 
             merged_total += 1
 
@@ -944,10 +1094,85 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
             skipped_total += 1
 
         if skip_rows:
+            operations_log.append(
+                f"  '{unit}'：总表已有{existing}人，合并{merge_count}行，跳过{len(skip_rows)}行"
+            )
             logger.info(f"  '{unit}'：总表已有{existing}人，"
                         f"合并{merge_count}行，跳过{len(skip_rows)}行")
 
     logger.info(f"合并完成：成功合并 {merged_total} 行，跳过 {skipped_total} 行")
+    operations_log.append(f"  合并总表：成功合并 {merged_total} 行，跳过 {skipped_total} 行")
+
+    # ============================================================
+    # 去重：合并后按单位名称去重，累加 全校已有人数
+    # ============================================================
+    if total_count_col is not None and merged_total > 0:
+        logger.info("合并后去重：按单位名称去重，累加全校已有人数...")
+
+        # 读取总表所有数据
+        total_headers = []
+        for cell in total_ws[1]:
+            total_headers.append(cell.value)
+
+        total_data_rows = []
+        for row in total_ws.iter_rows(min_row=2, values_only=True):
+            total_data_rows.append(row)
+
+        if total_data_rows:
+            # 按单位名称分组
+            unit_data = {}  # {unit: (row_data_list)}
+            unit_order = []  # 保持顺序
+            for row_data in total_data_rows:
+                # 找到单位名称列索引
+                unit_val = None
+                for i, h in enumerate(total_headers):
+                    if h and total_unit_col == i + 1:
+                        # Column index is 1-based, list index is 0-based
+                        pass
+                # Simpler: use total_unit_col (1-based) directly
+                unit_idx_0 = total_unit_col - 1  # 0-based
+                if unit_idx_0 < len(row_data):
+                    unit_val = row_data[unit_idx_0]
+
+                if unit_val and str(unit_val).strip():
+                    u = str(unit_val).strip()
+                    if u not in unit_data:
+                        unit_data[u] = []
+                        unit_order.append(u)
+                    unit_data[u].append(row_data)
+
+            # 去重：每单位保留一行，累加全校已有人数
+            count_idx_0 = total_count_col - 1 if total_count_col else -1
+            deduped_rows = []
+            dup_merged_count = 0
+            for u in unit_order:
+                rows = unit_data[u]
+                if len(rows) == 1:
+                    deduped_rows.append(rows[0])
+                else:
+                    # 多行 → 保留第一行，但累加全校已有人数
+                    merged_row = list(rows[0])
+                    if count_idx_0 >= 0:
+                        total_sum = 0
+                        for r in rows:
+                            try:
+                                total_sum += float(r[count_idx_0]) if r[count_idx_0] is not None else 0
+                            except (ValueError, TypeError):
+                                total_sum += 0
+                        merged_row[count_idx_0] = total_sum
+                    deduped_rows.append(merged_row)
+                    dup_merged_count += len(rows) - 1
+
+            if dup_merged_count > 0:
+                logger.info(f"  去重完成：合并了 {dup_merged_count} 个重复单位行")
+                operations_log.append(f"  总表去重：合并了 {dup_merged_count} 个重复单位行")
+
+                # 清空数据行并重写
+                total_ws.delete_rows(2, total_ws.max_row)
+                for row_data in deduped_rows:
+                    total_ws.append(row_data)
+                logger.info(f"  去重后总表共 {len(deduped_rows)} 行")
+
     return total_wb
 
 
@@ -986,6 +1211,7 @@ def phase4_output(ws, total_wb, col_indices, yellow_rows, red_rows, args):
 
         ws.parent.save(output1_path)
         logger.info(f"  ✓ 输出文件1：{output1_path}")
+        operations_log.append(f"  输出文件1：处理后的书院表格 → {output1_path}")
     except Exception as e:
         logger.error(f"  ✗ 保存书院表格失败：{e}")
 
@@ -996,6 +1222,7 @@ def phase4_output(ws, total_wb, col_indices, yellow_rows, red_rows, args):
         try:
             total_wb.save(output2_path)
             logger.info(f"  ✓ 输出文件2：{output2_path}")
+            operations_log.append(f"  输出文件2：更新后总表 → {output2_path}")
         except Exception as e:
             logger.error(f"  ✗ 保存全校总表失败：{e}")
         finally:
@@ -1046,6 +1273,7 @@ def phase4_output(ws, total_wb, col_indices, yellow_rows, red_rows, args):
             error_wb.save(output3_path)
             error_wb.close()
             logger.info(f"  ✓ 输出文件3：{output3_path}（共 {len(error_rows)} 行）")
+            operations_log.append(f"  输出文件3：出错学生信息 → {output3_path}（{len(error_rows)} 行）")
         else:
             logger.info("  - 无标黄行，跳过生成出错学生信息表")
     else:
@@ -1056,7 +1284,7 @@ def phase4_output(ws, total_wb, col_indices, yellow_rows, red_rows, args):
 # 汇总统计
 # ============================================================
 def print_summary(ws, yellow_rows, red_rows):
-    """打印处理汇总"""
+    """打印处理汇总和详细操作日志"""
     total_data_rows = ws.max_row - 1
     yellow_count = len(yellow_rows)
     red_count = len(red_rows)
@@ -1066,11 +1294,23 @@ def print_summary(ws, yellow_rows, red_rows):
     logger.info("=" * 60)
     logger.info("  处理完成 — 汇总报告")
     logger.info("=" * 60)
-    logger.info(f"  总数据行数：  {total_data_rows}")
-    logger.info(f"  审核通过：    {clean_count} 行")
-    logger.info(f"  标黄（异常）：{yellow_count} 行")
-    logger.info(f"  标红（未找到）：{red_count} 行")
+    logger.info(f"  总数据行数：     {total_data_rows}")
+    logger.info(f"  审核通过：       {clean_count} 行")
+    logger.info(f"  标黄（警告）：   {yellow_count} 行")
+    logger.info(f"  标红（未找到）： {red_count} 行")
     logger.info("=" * 60)
+
+    # ---- 输出详细操作日志 ----
+    if operations_log:
+        logger.info("")
+        logger.info("-" * 60)
+        logger.info("  本次操作明细")
+        logger.info("-" * 60)
+        for op in operations_log:
+            logger.info(op)
+        logger.info("-" * 60)
+        logger.info(f"  共 {len(operations_log)} 项操作")
+        logger.info("=" * 60)
 
 
 # ============================================================
@@ -1095,6 +1335,10 @@ def main():
     logger.info("输出目录：output/")
     logger.info("")
 
+    # 清空操作日志
+    global operations_log
+    operations_log = []
+
     try:
         # ========== 解析企业信息 ==========
         enterprise_dict = parse_enterprise_info(args.enterprise)
@@ -1105,7 +1349,7 @@ def main():
         # 确保必要列存在
         col_indices = ensure_columns(
             ws, col_indices,
-            [REASON_COL, CREDIT_CODE_COL, REG_CAPITAL_COL]
+            [REASON_COL, CREDIT_CODE_COL, REG_CAPITAL_COL, THIS_SUBMIT_COL]
         )
 
         # ========== 第一阶段：匹配与填充 ==========
@@ -1127,6 +1371,12 @@ def main():
             total_data.append(row)
         total_df = pd.DataFrame(total_data, columns=total_headers)
         total_wb_for_check.close()
+
+        # 记录总表已有数据概况
+        if total_df is not None and not total_df.empty:
+            operations_log.append(
+                f"  全校总表加载：{len(total_df)} 行数据"
+            )
 
         # ========== 第二阶段：业务规则审核 ==========
         yellow_rows, headcount_yellow_rows = phase2_headcount_rule(
