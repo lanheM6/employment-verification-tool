@@ -71,22 +71,105 @@ operations_log = []
 # ============================================================
 # 命令行参数解析
 # ============================================================
+# ============================================================
+# 自动识别输入文件
+# ============================================================
+def auto_detect_files(input_dir="input"):
+    """
+    扫描 input 目录，根据文件名关键词智能匹配三类输入文件。
+
+    返回 (new_xlsx, total_xlsx, enterprise_txt)，未匹配到的为 None。
+    """
+    if not os.path.exists(input_dir):
+        return None, None, None
+
+    all_files = os.listdir(input_dir)
+    xlsx_files = [f for f in all_files
+                  if f.endswith('.xlsx') and os.path.isfile(os.path.join(input_dir, f))]
+    txt_files = [f for f in all_files
+                 if f.endswith('.txt') and os.path.isfile(os.path.join(input_dir, f))]
+
+    new_file = None
+    total_file = None
+    enterprise_file = None
+
+    # ---- 企业信息（.txt）：关键词打分 ----
+    best_ent_score = 0
+    for f in txt_files:
+        name = os.path.splitext(f)[0]
+        score = 0
+        if '企业' in name:
+            score += 10
+        if '信息' in name:
+            score += 5
+        if score > best_ent_score:
+            best_ent_score = score
+            enterprise_file = os.path.join(input_dir, f)
+
+    # ---- 两个表格（.xlsx）：分别打分 ----
+    def _score_new(name):
+        s = 0
+        if '书院' in name:      s += 10
+        if '待筛选' in name:    s += 5
+        if '待审核' in name:    s += 5
+        if '筛选' in name:      s += 3
+        if '审核' in name:      s += 3
+        if '全校' in name:      s -= 5
+        if '总表' in name:      s -= 5
+        if '总表格' in name:    s -= 5
+        return s
+
+    def _score_total(name):
+        s = 0
+        if '全校' in name:      s += 10
+        if '总表' in name:      s += 5
+        if '总表格' in name:    s += 5
+        if '汇总' in name:      s += 3
+        if '书院' in name:      s -= 5
+        if '待筛选' in name:    s -= 5
+        if '待审核' in name:    s -= 5
+        return s
+
+    best_new_score = -999
+    best_total_score = -999
+    for f in xlsx_files:
+        name = os.path.splitext(f)[0]
+        n_score = _score_new(name)
+        t_score = _score_total(name)
+        if n_score > best_new_score:
+            best_new_score = n_score
+            new_file = os.path.join(input_dir, f)
+        if t_score > best_total_score:
+            best_total_score = t_score
+            total_file = os.path.join(input_dir, f)
+
+    # 如果同一个文件被同时匹配为两种类型，按得分高低裁决
+    if new_file and new_file == total_file:
+        if best_new_score >= best_total_score:
+            total_file = None
+        else:
+            new_file = None
+
+    return new_file, total_file, enterprise_file
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="就业数据自动化处理工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法：
-  python data_processor.py
-  python data_processor.py --new "input/书院待筛选表格.xlsx" --total "input/全校数据总表格.xlsx" --enterprise "input/所有企业信息.txt"
+  python data_processor.py                                         # 自动识别 input/ 目录
+  python data_processor.py --new "input/弘毅书院待审核单位.xlsx"       # 部分自动 + 部分显式
+  python data_processor.py --new "..." --total "..." --enterprise "..."   # 完全手动
         """
     )
-    parser.add_argument("--new", type=str, default="input/书院待筛选表格.xlsx",
-                        help="书院待筛选表格文件路径（默认：input/书院待筛选表格.xlsx）")
-    parser.add_argument("--total", type=str, default="input/全校数据总表格.xlsx",
-                        help="全校数据总表格文件路径（默认：input/全校数据总表格.xlsx）")
-    parser.add_argument("--enterprise", type=str, default="input/所有企业信息.txt",
-                        help="所有企业信息文件路径（默认：input/所有企业信息.txt）")
+    parser.add_argument("--new", type=str, default=None,
+                        help='新数据表格路径（不指定则自动识别 input/ 目录）')
+    parser.add_argument("--total", type=str, default=None,
+                        help='全校总表路径（不指定则自动识别 input/ 目录）')
+    parser.add_argument("--enterprise", type=str, default=None,
+                        help='企业信息文件路径（不指定则自动识别 input/ 目录）')
     return parser.parse_args()
 
 
@@ -1452,6 +1535,16 @@ def main():
     # 确保 input/ 和 output/ 目录存在
     os.makedirs("input", exist_ok=True)
     os.makedirs("output", exist_ok=True)
+
+    # ---- 自动识别未通过 CLI 显式指定的输入文件 ----
+    if args.new is None or args.total is None or args.enterprise is None:
+        detected_new, detected_total, detected_ent = auto_detect_files("input")
+        args.new = args.new or detected_new
+        args.total = args.total or detected_total
+        args.enterprise = args.enterprise or detected_ent
+        if not all([args.new, args.total, args.enterprise]):
+            logger.error("无法自动识别全部输入文件，请使用 --new/--total/--enterprise 显式指定路径")
+            return 1
 
     logger.info("")
     logger.info("╔" + "═" * 58 + "╗")
