@@ -1133,14 +1133,16 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
             continue
 
         # 从前往后取行，直到名额用完
+        # 标黄行合并时使用 y 值（写入总表的值）而非原人数
         merge_rows = []
         skip_rows = []
         accumulated = 0
         for item in approved_rows:
             r_idx, people = item
-            if accumulated < can_add and accumulated + people <= can_add:
+            effective_people = y if r_idx in yellow_rows else people
+            if accumulated < can_add and accumulated + effective_people <= can_add:
                 merge_rows.append(item)
-                accumulated += people
+                accumulated += effective_people
             else:
                 skip_rows.append(item)
 
