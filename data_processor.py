@@ -7,7 +7,7 @@
 
 处理流程：
   第一阶段：加载书院表格，解析企业信息TXT，匹配并修正企业信息
-  第二阶段：校内人数配额检查、注册资本审核、个体工商户审核
+  第二阶段：填充全校已有人数列、校内人数配额检查、注册资本审核、个体工商户审核
   第三阶段：将审核通过的数据合并到全校总表
   第四阶段：输出处理后的书院表格、更新后总表、出错学生信息
 
@@ -575,8 +575,7 @@ def phase1_match_and_fill(ws, df, enterprise_dict, col_indices):
                 unit_name, list(enterprise_dict.keys())
             )
             if fuzzy_match:
-                # 找到相似单位 → 修正单位名称，使用匹配到的企业信息
-                ws.cell(row=row_idx, column=unit_col_idx, value=fuzzy_match)
+                # 找到相似单位 → 不修改原单元格，在原因列注明正确名称
                 info = enterprise_dict[fuzzy_match]
 
                 correct_credit = info.get(CREDIT_CODE_COL, "")
@@ -590,10 +589,10 @@ def phase1_match_and_fill(ws, df, enterprise_dict, col_indices):
                 yellow_rows.add(row_idx)
                 if reason_col_idx:
                     append_reason(ws, row_idx, reason_col_idx,
-                                  f"单位名称有误，已纠正为：{fuzzy_match}")
+                                  f"单位名称有误，正确名称：{fuzzy_match}")
                 corrected_count += 1
                 operations_log.append(
-                    f"  行{row_idx}：单位名称'{unit_name}'模糊匹配→'{fuzzy_match}'（相似度{score:.0%}），已修正"
+                    f"  行{row_idx}：单位名称'{unit_name}'应改为'{fuzzy_match}'（相似度{score:.0%}），已在原因注明"
                 )
                 matched_count += 1
                 logger.debug(f"  行{row_idx}：'{unit_name}' 模糊匹配→'{fuzzy_match}'（{score:.0%}）")
@@ -661,7 +660,7 @@ def phase2_headcount_rule(ws, df, total_df, col_indices, yellow_rows, red_rows):
 
     if unit_col_idx is None:
         logger.error("找不到'单位'列，跳过人数配额检查")
-        return yellow_rows
+        return yellow_rows, set()
 
     num_cols = ws.max_column
     new_yellows = set()
@@ -676,7 +675,7 @@ def phase2_headcount_rule(ws, df, total_df, col_indices, yellow_rows, red_rows):
 
     if total_unit_col is None:
         logger.error("全校总表中找不到'单位名称'列，跳过人数配额检查")
-        return yellow_rows
+        return yellow_rows, set()
 
     # 收集书院表中所有单位的行分布
     unit_row_map = {}
@@ -752,7 +751,9 @@ def phase2_capital_rule(ws, df, enterprise_dict, col_indices, yellow_rows, red_r
     """
     注册资本审核规则：
       - 20 <= 注册资本 < 50：该单位最多上报2人，超过则标黄
-      - 0 < 注册资本 < 20：标黄，需老师确认
+      - 10 < 注册资本 <= 20：该单位最多上报2人，超过则标黄
+      - 1 <= 注册资本 <= 10：该单位最多上报1人，超过则标黄
+      - 0 < 注册资本 < 1：标黄，需老师确认
       - 注册资本为空/0（如分公司）：跳过检查
     """
     logger.info("-" * 40)
@@ -804,18 +805,46 @@ def phase2_capital_rule(ws, df, enterprise_dict, col_indices, yellow_rows, red_r
                 )
                 logger.info(f"  '{unit}'：注册资本{cap_value}万元"
                             f"（20~50万区间），上报{active_count}人 > 2人 → 标黄")
-        elif 0 < cap_value < 20:
-            reason = "注册资本少于20万，需反馈老师确认"
+        elif 0 < cap_value < 1:
+            reason = "注册资本少于1万，需反馈老师确认"
             for r_idx in active_rows:
                 highlight_row(ws, r_idx, YELLOW_FILL, num_cols)
                 new_yellows.add(r_idx)
                 if reason_col_idx:
                     append_reason(ws, r_idx, reason_col_idx, reason)
             operations_log.append(
-                f"  '{unit}'：注册资本{cap_value}万（少于20万）→ 标黄，需反馈老师确认"
+                f"  '{unit}'：注册资本{cap_value}万（少于1万）→ 标黄，需反馈老师确认"
             )
             logger.info(f"  '{unit}'：注册资本{cap_value}万元"
-                        f"（少于20万）→ 标黄")
+                        f"（少于1万）→ 标黄")
+        elif 1 <= cap_value <= 10:
+            if active_count > 1:
+                reason = "注册资本不超过10万，最多报1人"
+                for r_idx in active_rows:
+                    highlight_row(ws, r_idx, YELLOW_FILL, num_cols)
+                    new_yellows.add(r_idx)
+                    if reason_col_idx:
+                        append_reason(ws, r_idx, reason_col_idx, reason)
+                operations_log.append(
+                    f"  '{unit}'：注册资本{cap_value}万（1~10万区间），"
+                    f"上报{active_count}人超过1人限制 → 标黄"
+                )
+                logger.info(f"  '{unit}'：注册资本{cap_value}万元"
+                            f"（1~10万区间），上报{active_count}人 > 1人 → 标黄")
+        elif 10 < cap_value <= 20:
+            if active_count > 2:
+                reason = "注册资本不超过20万，最多报2人"
+                for r_idx in active_rows:
+                    highlight_row(ws, r_idx, YELLOW_FILL, num_cols)
+                    new_yellows.add(r_idx)
+                    if reason_col_idx:
+                        append_reason(ws, r_idx, reason_col_idx, reason)
+                operations_log.append(
+                    f"  '{unit}'：注册资本{cap_value}万（10~20万区间），"
+                    f"上报{active_count}人超过2人限制 → 标黄"
+                )
+                logger.info(f"  '{unit}'：注册资本{cap_value}万元"
+                            f"（10~20万区间），上报{active_count}人 > 2人 → 标黄")
 
     yellow_rows.update(new_yellows)
     logger.info(f"注册资本审核完成，新增标黄 {len(new_yellows)} 行")
@@ -857,10 +886,10 @@ def phase2_other_rules(ws, df, col_indices, yellow_rows, red_rows):
     yellow_rows.update(new_yellows)
     if new_yellows:
         operations_log.append(f"  个体工商户检查：{len(new_yellows)} 行因92开头被标黄")
-        logger.info(f"个体工商户检查完成，{len(new_yellows)} 行被标黄")
+        logger.info(f"个体工商户检查完成，{len(new_yellows)} 行被标黄（不可合并）")
     else:
         logger.info("个体工商户检查完成，无匹配项")
-    return yellow_rows
+    return yellow_rows, new_yellows
 
 
 # ============================================================
@@ -908,24 +937,25 @@ def phase2_status_rule(ws, df, enterprise_dict, col_indices, yellow_rows, red_ro
 
     yellow_rows.update(new_yellows)
     if new_yellows:
-        operations_log.append(f'  企业状态审核：{len(new_yellows)} 行因状态为"注销"被标黄')
-        logger.info(f"企业状态审核完成，{len(new_yellows)} 行被标黄（状态为注销）")
+        operations_log.append(f'  企业状态审核：{len(new_yellows)} 行因状态为"注销"被标黄（不可合并）')
+        logger.info(f"企业状态审核完成，{len(new_yellows)} 行被标黄（状态为注销，不可合并）")
     else:
         logger.info("企业状态审核完成，无注销状态企业")
-    return yellow_rows
+    return yellow_rows, new_yellows
 
 
 # ============================================================
 # 第三阶段：数据合并到总表（核心难点）
 # ============================================================
 def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
-                 yellow_rows, red_rows, headcount_yellow_rows=None):
+                 yellow_rows, red_rows, headcount_yellow_rows=None,
+                 unmergeable_yellows=None):
     """
     将书院表格中审核通过的行合并到全校总表。
 
     合并逻辑：
-      1. 跳过标红行和因人数超限额标黄的行
-      2. 因数据错误（信用代码、注册资本、个体工商户、状态）标黄的行仍可合并
+      1. 跳过标红行、因人数超限额标黄的行、个体工商户和注销状态标黄的行
+      2. 因数据错误（信用代码、注册资本）标黄的行仍可合并
       3. 只复制 单位名称、社会信用代码、注册资本、本次上报人数 四列
       4. 本次上报人数 → 全校已有人数（标黄行用 y 值）
       5. 合并后按单位名称去重，累加全校已有人数
@@ -938,6 +968,8 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
 
     if headcount_yellow_rows is None:
         headcount_yellow_rows = set()
+    if unmergeable_yellows is None:
+        unmergeable_yellows = set()
 
     unit_col_idx = col_indices.get(UNIT_NAME_COL)
     credit_col_idx = col_indices.get(CREDIT_CODE_COL)
@@ -1000,7 +1032,7 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
     unit_approved = {}
 
     for row_idx in range(2, ws.max_row + 1):
-        if row_idx in red_rows or row_idx in headcount_yellow_rows:
+        if row_idx in red_rows or row_idx in headcount_yellow_rows or row_idx in unmergeable_yellows:
             continue
         val = ws.cell(row=row_idx, column=unit_col_idx).value
         if val and str(val).strip():
@@ -1378,6 +1410,51 @@ def main():
                 f"  全校总表加载：{len(total_df)} 行数据"
             )
 
+        # ========== 准备工作：新增全校已有人数列并填充 x 值 ==========
+        logger.info("")
+        logger.info("准备工作：填充全校已有人数列")
+        # 计算各单位在总表中的累计已有人数
+        total_unit_col_name = None
+        for col in total_df.columns:
+            if col and "单位" in str(col):
+                total_unit_col_name = col
+                break
+
+        total_count_col_name = None
+        for col in total_df.columns:
+            if col and TOTAL_COUNT_COL in str(col):
+                total_count_col_name = col
+                break
+
+        existing_x_map = {}  # {unit: x}
+        if total_unit_col_name is not None:
+            for _, row in total_df.iterrows():
+                unit = str(row[total_unit_col_name]).strip() if pd.notna(row[total_unit_col_name]) else ""
+                if unit:
+                    count_val = 0
+                    if total_count_col_name and pd.notna(row.get(total_count_col_name)):
+                        count_val = int(pd.to_numeric(row[total_count_col_name], errors='coerce') or 0)
+                    else:
+                        count_val = 1  # 没有全校已有人数列则每行算1人
+                    existing_x_map[unit] = existing_x_map.get(unit, 0) + count_val
+
+        # 在书院表中新增/填充"全校已有人数"列
+        col_indices = ensure_columns(ws, col_indices, [TOTAL_COUNT_COL])
+        total_count_col_idx = col_indices.get(TOTAL_COUNT_COL)
+        unit_col_idx = col_indices.get(UNIT_NAME_COL)
+        prep_filled = 0
+        for row_idx in range(2, ws.max_row + 1):
+            unit_val = ws.cell(row=row_idx, column=unit_col_idx).value if unit_col_idx else None
+            if unit_val and str(unit_val).strip():
+                unit_name = str(unit_val).strip()
+                x_val = existing_x_map.get(unit_name, 0)
+                ws.cell(row=row_idx, column=total_count_col_idx, value=x_val)
+                prep_filled += 1
+        operations_log.append(
+            f"  全校已有人数准备：已填充 {prep_filled} 行"
+        )
+        logger.info(f"准备工作完成，已填充 {prep_filled} 行的'全校已有人数'值")
+
         # ========== 第二阶段：业务规则审核 ==========
         yellow_rows, headcount_yellow_rows = phase2_headcount_rule(
             ws, df, total_df, col_indices, yellow_rows, red_rows
@@ -1385,17 +1462,20 @@ def main():
         yellow_rows = phase2_capital_rule(
             ws, df, enterprise_dict, col_indices, yellow_rows, red_rows
         )
-        yellow_rows = phase2_other_rules(
+        yellow_rows, biz_yellow_rows = phase2_other_rules(
             ws, df, col_indices, yellow_rows, red_rows
         )
-        yellow_rows = phase2_status_rule(
+        yellow_rows, status_yellow_rows = phase2_status_rule(
             ws, df, enterprise_dict, col_indices, yellow_rows, red_rows
         )
+
+        # 收集不可合并行
+        unmergeable_yellows = biz_yellow_rows | status_yellow_rows
 
         # ========== 第三阶段：合并到总表 ==========
         total_wb = phase3_merge(
             ws, args.total, enterprise_dict, col_indices,
-            yellow_rows, red_rows, headcount_yellow_rows
+            yellow_rows, red_rows, headcount_yellow_rows, unmergeable_yellows
         )
 
         # ========== 第四阶段：输出 ==========
