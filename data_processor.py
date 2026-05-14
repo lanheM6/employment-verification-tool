@@ -657,6 +657,7 @@ def phase2_headcount_rule(ws, df, total_df, col_indices, yellow_rows, red_rows):
 
     reason_col_idx = col_indices.get(REASON_COL)
     unit_col_idx = col_indices.get(UNIT_NAME_COL)
+    submit_col_idx = col_indices.get(THIS_SUBMIT_COL)
 
     if unit_col_idx is None:
         logger.error("找不到'单位'列，跳过人数配额检查")
@@ -686,12 +687,19 @@ def phase2_headcount_rule(ws, df, total_df, col_indices, yellow_rows, red_rows):
             unit_row_map.setdefault(unit, []).append(row_idx)
 
     for unit, rows in unit_row_map.items():
-        # 当前本次上报的有效行数（不包含已标红的）
+        # 当前本次上报的有效行（不包含已标红的）
         active_rows = [r for r in rows if r not in red_rows]
         if not active_rows:
             continue
 
-        current_count = len(active_rows)
+        # 计算本次上报人数总和（而非行数）
+        current_count = 0
+        for r_idx in active_rows:
+            submit_val = ws.cell(row=r_idx, column=submit_col_idx).value if submit_col_idx else None
+            try:
+                current_count += int(float(submit_val))
+            except (ValueError, TypeError):
+                current_count += 1  # 无法转换则算1人
 
         # 总表中该单位已有人数
         # 优先使用 全校已有人数 列（用于支持总表去重后的行数统计）
@@ -719,24 +727,40 @@ def phase2_headcount_rule(ws, df, total_df, col_indices, yellow_rows, red_rows):
 
         if total_count > MAX_PEOPLE_PER_UNIT:
             y = MAX_PEOPLE_PER_UNIT - existing_count  # 最多还能增加的人数
-            if y < current_count:
-                excess_count = max(0, current_count - max(0, y))
-                reason = f"全校已有{existing_count}人，最多还能增加{y}人"
-                # 只标黄超出限额的行，未超出的留给第三阶段合并
-                excess_rows = active_rows[-excess_count:] if excess_count > 0 else []
-                for r_idx in excess_rows:
-                    if r_idx not in red_rows:
-                        highlight_row(ws, r_idx, YELLOW_FILL, num_cols)
-                        headcount_yellow_rows.add(r_idx)
-                        new_yellows.add(r_idx)
-                        if reason_col_idx:
-                            append_reason(ws, r_idx, reason_col_idx, reason)
-                operations_log.append(
-                    f"  '{unit}'：全校已有{existing_count}人，本次上报{current_count}人，"
-                    f"最多增{y}人，{excess_count}行因超额标黄"
-                )
-                logger.info(f"  '{unit}'：全校已有{existing_count}人，"
-                            f"本次上报{current_count}人，最多增{y}人 → {excess_count}行超出")
+            reason = f"全校已有{existing_count}人，最多还能增加{y}人"
+
+            # 从前往后累计，找到在名额内能容纳的行
+            cumulative = 0
+            split_idx = 0
+            for r_idx in active_rows:
+                if cumulative >= y:
+                    break
+                submit_val = ws.cell(row=r_idx, column=submit_col_idx).value if submit_col_idx else None
+                try:
+                    people = int(float(submit_val))
+                except (ValueError, TypeError):
+                    people = 1
+                if cumulative + people > y:
+                    break
+                cumulative += people
+                split_idx += 1
+
+            # split_idx 之后的行都是超额的
+            excess_rows = active_rows[split_idx:]
+            excess_people = current_count - cumulative
+            for r_idx in excess_rows:
+                if r_idx not in red_rows:
+                    highlight_row(ws, r_idx, YELLOW_FILL, num_cols)
+                    headcount_yellow_rows.add(r_idx)
+                    new_yellows.add(r_idx)
+                    if reason_col_idx:
+                        append_reason(ws, r_idx, reason_col_idx, reason)
+            operations_log.append(
+                f"  '{unit}'：全校已有{existing_count}人，本次上报{current_count}人，"
+                f"最多增{y}人，{len(excess_rows)}行（共{excess_people}人）因超额标黄"
+            )
+            logger.info(f"  '{unit}'：全校已有{existing_count}人，"
+                        f"本次上报{current_count}人，最多增{y}人 → {len(excess_rows)}行超出")
 
     yellow_rows.update(new_yellows)
     logger.info(f"人数配额检查完成，新增标黄 {len(new_yellows)} 行"
@@ -762,8 +786,20 @@ def phase2_capital_rule(ws, df, enterprise_dict, col_indices, yellow_rows, red_r
 
     reason_col_idx = col_indices.get(REASON_COL)
     unit_col_idx = col_indices.get(UNIT_NAME_COL)
+    submit_col_idx = col_indices.get(THIS_SUBMIT_COL)
     num_cols = ws.max_column
     new_yellows = set()
+
+    def _sum_submit(rows):
+        """计算 rows 中 本次上报人数 的总和"""
+        total = 0
+        for r in rows:
+            v = ws.cell(row=r, column=submit_col_idx).value if submit_col_idx else None
+            try:
+                total += int(float(v))
+            except (ValueError, TypeError):
+                total += 1
+        return total
 
     if unit_col_idx is None:
         logger.error("找不到'单位'列，跳过注册资本审核")
@@ -789,7 +825,10 @@ def phase2_capital_rule(ws, df, enterprise_dict, col_indices, yellow_rows, red_r
 
         # 有效行（不包含已标红的）
         active_rows = [r for r in rows if r not in red_rows]
-        active_count = len(active_rows)
+        if not active_rows:
+            continue
+
+        active_count = _sum_submit(active_rows)
 
         if 20 <= cap_value < 50:
             if active_count > 2:
@@ -954,8 +993,8 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
     将书院表格中审核通过的行合并到全校总表。
 
     合并逻辑：
-      1. 跳过标红行、因人数超限额标黄的行、个体工商户和注销状态标黄的行
-      2. 因数据错误（信用代码、注册资本）标黄的行仍可合并
+      1. 跳过标红行、个体工商户和注销状态标黄的行
+      2. 其他标黄的行（人数超限额、信用代码、注册资本等）仍可合并，使用 y 值
       3. 只复制 单位名称、社会信用代码、注册资本、本次上报人数 四列
       4. 本次上报人数 → 全校已有人数（标黄行用 y 值）
       5. 合并后按单位名称去重，累加全校已有人数
@@ -1019,25 +1058,39 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
         total_wb.close()
         return None
 
-    # ---- 统计总表各单位的现有行数 ----
+    # ---- 统计总表各单位的累计已有人数 ----
     last_total_row = total_ws.max_row
     existing_counts = {}
     for row_idx in range(2, last_total_row + 1):
-        val = total_ws.cell(row=row_idx, column=total_unit_col).value
-        if val and str(val).strip():
-            unit = str(val).strip()
-            existing_counts[unit] = existing_counts.get(unit, 0) + 1
+        unit_val = total_ws.cell(row=row_idx, column=total_unit_col).value
+        if unit_val and str(unit_val).strip():
+            unit = str(unit_val).strip()
+            count_val = 0
+            if total_count_col is not None:
+                cell_v = total_ws.cell(row=row_idx, column=total_count_col).value
+                try:
+                    count_val = int(float(cell_v)) if cell_v is not None else 0
+                except (ValueError, TypeError):
+                    count_val = 0
+            else:
+                count_val = 1  # 没有全校已有人数列则每行算1人
+            existing_counts[unit] = existing_counts.get(unit, 0) + count_val
 
-    # ---- 收集书院表中各单位的已审核通过的行 ----
-    unit_approved = {}
+    # ---- 收集书院表中各单位的已审核通过的行及其本次上报人数 ----
+    unit_approved = {}  # {unit: [(row_idx, people), ...]}
 
     for row_idx in range(2, ws.max_row + 1):
-        if row_idx in red_rows or row_idx in headcount_yellow_rows or row_idx in unmergeable_yellows:
+        if row_idx in red_rows or row_idx in unmergeable_yellows:
             continue
         val = ws.cell(row=row_idx, column=unit_col_idx).value
         if val and str(val).strip():
             unit = str(val).strip()
-            unit_approved.setdefault(unit, []).append(row_idx)
+            submit_val = ws.cell(row=row_idx, column=submit_col_idx).value if submit_col_idx else None
+            try:
+                people = int(float(submit_val))
+            except (ValueError, TypeError):
+                people = 1
+            unit_approved.setdefault(unit, []).append((row_idx, people))
 
     logger.info(f"待合并单位数：{len(unit_approved)}")
 
@@ -1060,9 +1113,12 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
         can_add = MAX_PEOPLE_PER_UNIT - existing
         y = max(0, can_add)  # 最多还能增加的人数
 
-        if can_add <= 0:
+        # 计算本次上报人数总和
+        submit_total = sum(p for _, p in approved_rows)
+
+        if can_add <= 0 or submit_total <= 0:
             # 名额已满，全部跳过
-            for r_idx in approved_rows:
+            for r_idx, _ in approved_rows:
                 if reason_col_idx:
                     append_reason(ws, r_idx, reason_col_idx,
                                   "因全校该单位名额已满，未合并")
@@ -1070,19 +1126,26 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
                 yellow_rows.add(r_idx)
             skipped_total += len(approved_rows)
             operations_log.append(
-                f"  '{unit}'：名额已满（总表已有{existing}人），跳过{len(approved_rows)}行"
+                f"  '{unit}'：名额已满（总表已有{existing}人），跳过{len(approved_rows)}行（共{submit_total}人）"
             )
             logger.info(f"  '{unit}'：名额已满（总表已有{existing}人），"
-                        f"跳过{len(approved_rows)}行")
+                        f"跳过{len(approved_rows)}行（共{submit_total}人）")
             continue
 
-        # 决定本次可合并的行数
-        merge_count = min(can_add, len(approved_rows))
-        merge_rows = approved_rows[:merge_count]
-        skip_rows = approved_rows[merge_count:]
+        # 从前往后取行，直到名额用完
+        merge_rows = []
+        skip_rows = []
+        accumulated = 0
+        for item in approved_rows:
+            r_idx, people = item
+            if accumulated < can_add and accumulated + people <= can_add:
+                merge_rows.append(item)
+                accumulated += people
+            else:
+                skip_rows.append(item)
 
         # --- 执行合并：逐行追加到总表 ---
-        for r_idx in merge_rows:
+        for r_idx, _ in merge_rows:
             new_row_idx = last_total_row + 1
             last_total_row = new_row_idx
 
@@ -1112,25 +1175,29 @@ def phase3_merge(ws, total_filepath, enterprise_dict, col_indices,
                 else:
                     # 非标黄行：使用本次上报人数
                     submit_val = ws.cell(row=r_idx, column=submit_col_idx).value if submit_col_idx else 1
+                    try:
+                        submit_val = int(float(submit_val))
+                    except (ValueError, TypeError):
+                        submit_val = 1
                     total_ws.cell(row=new_row_idx, column=total_count_col, value=submit_val)
 
             merged_total += 1
 
         # --- 处理超出行（未能合并的行） ---
-        for r_idx in skip_rows:
+        for r_idx, _ in skip_rows:
             if reason_col_idx:
                 append_reason(ws, r_idx, reason_col_idx,
-                              "因全校该单位名额已满，未合并")
+                              "因全校该单位名额不足，未合并")
             highlight_row(ws, r_idx, YELLOW_FILL, ws.max_column)
             yellow_rows.add(r_idx)
             skipped_total += 1
 
         if skip_rows:
             operations_log.append(
-                f"  '{unit}'：总表已有{existing}人，合并{merge_count}行，跳过{len(skip_rows)}行"
+                f"  '{unit}'：总表已有{existing}人，合并{len(merge_rows)}行，跳过{len(skip_rows)}行"
             )
             logger.info(f"  '{unit}'：总表已有{existing}人，"
-                        f"合并{merge_count}行，跳过{len(skip_rows)}行")
+                        f"合并{len(merge_rows)}行，跳过{len(skip_rows)}行")
 
     logger.info(f"合并完成：成功合并 {merged_total} 行，跳过 {skipped_total} 行")
     operations_log.append(f"  合并总表：成功合并 {merged_total} 行，跳过 {skipped_total} 行")
@@ -1222,13 +1289,25 @@ def phase4_output(ws, total_wb, col_indices, yellow_rows, red_rows, args):
     logger.info("第四阶段：输出处理结果")
     logger.info("=" * 50)
 
-    today = datetime.now().strftime("%Y%m%d")
+    today = datetime.now().strftime("%Y%m%d_%H%M")
     output_dir = "output"
 
     # ========== 输出文件1：处理后的书院表格 ==========
     output1_path = os.path.join(output_dir, f"书院待筛选表格_已处理_{today}.xlsx")
     logger.info(f"正在保存处理后书院表格...")
     try:
+        # 将数值列中的文本格式数字转为实际数值
+        numeric_col_names = [THIS_SUBMIT_COL, TOTAL_COUNT_COL]
+        for col_name in numeric_col_names:
+            col_idx = col_indices.get(col_name)
+            if col_idx:
+                for row in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=row, column=col_idx)
+                    if cell.value is not None and isinstance(cell.value, str):
+                        try:
+                            cell.value = int(float(cell.value))
+                        except (ValueError, TypeError):
+                            pass  # 保留原文本（如注册资本"200万"）
         # 设置 header 样式（让表头更清晰）
         for col in range(1, ws.max_column + 1):
             cell = ws.cell(row=1, column=col)
@@ -1249,6 +1328,22 @@ def phase4_output(ws, total_wb, col_indices, yellow_rows, red_rows, args):
 
     # ========== 输出文件2：更新后的全校总表 ==========
     if total_wb is not None:
+        total_ws_out = total_wb.active
+        # 将全校已有人数列的文本数字转为数值
+        total_count_col_idx = None
+        for cell in total_ws_out[1]:
+            if cell.value == TOTAL_COUNT_COL:
+                total_count_col_idx = cell.column
+                break
+        if total_count_col_idx:
+            for row in range(2, total_ws_out.max_row + 1):
+                cell = total_ws_out.cell(row=row, column=total_count_col_idx)
+                if cell.value is not None and isinstance(cell.value, str):
+                    try:
+                        cell.value = int(float(cell.value))
+                    except (ValueError, TypeError):
+                        pass
+
         output2_path = os.path.join(output_dir, f"全校数据总表格_更新后_{today}.xlsx")
         logger.info(f"正在保存更新后全校总表...")
         try:
@@ -1433,7 +1528,8 @@ def main():
                 if unit:
                     count_val = 0
                     if total_count_col_name and pd.notna(row.get(total_count_col_name)):
-                        count_val = int(pd.to_numeric(row[total_count_col_name], errors='coerce') or 0)
+                        conv = pd.to_numeric(row[total_count_col_name], errors='coerce')
+                        count_val = int(conv) if pd.notna(conv) else 0
                     else:
                         count_val = 1  # 没有全校已有人数列则每行算1人
                     existing_x_map[unit] = existing_x_map.get(unit, 0) + count_val
