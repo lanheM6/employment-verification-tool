@@ -857,10 +857,10 @@ def phase2_headcount_rule(ws, df, total_df, col_indices, yellow_rows, red_rows):
 def phase2_capital_rule(ws, df, enterprise_dict, col_indices, yellow_rows, red_rows):
     """
     注册资本审核规则：
-      - 20 <= 注册资本 < 50：该单位最多上报2人，超过则标黄
-      - 10 < 注册资本 <= 20：该单位最多上报2人，超过则标黄
-      - 1 <= 注册资本 <= 10：该单位最多上报1人，超过则标黄
-      - 0 < 注册资本 < 1：标黄，需老师确认
+      - 0 < 注册资本 < 1万：标黄，需老师确认
+      - 1万 ≤ 注册资本 ≤ 10万：该单位最多上报1人，超过则标黄
+      - 10万 < 注册资本 ≤ 20万：该单位最多上报2人，超过则标黄
+      - 注册资本 > 20万：默认3人上限，不额外限制
       - 注册资本为空/0（如分公司）：跳过检查
     """
     logger.info("-" * 40)
@@ -913,21 +913,7 @@ def phase2_capital_rule(ws, df, enterprise_dict, col_indices, yellow_rows, red_r
 
         active_count = _sum_submit(active_rows)
 
-        if 20 <= cap_value < 50:
-            if active_count > 2:
-                reason = "注册资本不足50万，最多报2人"
-                for r_idx in active_rows:
-                    highlight_row(ws, r_idx, YELLOW_FILL, num_cols)
-                    new_yellows.add(r_idx)
-                    if reason_col_idx:
-                        append_reason(ws, r_idx, reason_col_idx, reason)
-                operations_log.append(
-                    f"  '{unit}'：注册资本{cap_value}万（20~50万区间），"
-                    f"上报{active_count}人超过2人限制 → 标黄"
-                )
-                logger.info(f"  '{unit}'：注册资本{cap_value}万元"
-                            f"（20~50万区间），上报{active_count}人 > 2人 → 标黄")
-        elif 0 < cap_value < 1:
+        if 0 < cap_value < 1:
             reason = "注册资本少于1万，需反馈老师确认"
             for r_idx in active_rows:
                 highlight_row(ws, r_idx, YELLOW_FILL, num_cols)
